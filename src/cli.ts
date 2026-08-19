@@ -1,6 +1,7 @@
 // src/cli.ts
 // 拼装层 —— 把 llm / agent / tui / tools 粘起来，是唯一入口。
 // session 持久化：每轮结束把 context.messages append 到 ~/.nanopi/session.jsonl。
+// 环境变量：除 export 外也支持从 .env 文件读取（Node 22+ 内置 loadEnvFile，零依赖）。
 
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
@@ -21,9 +22,10 @@ const SYSTEM_PROMPT = '你是一个编码助手。用提供的工具读写文件
 let persistedCount = 0
 
 async function main() {
+  loadDotEnv()  // 先读 .env，再取环境变量
   const apiKey = process.env.NANOPI_API_KEY
   if (!apiKey) {
-    console.error('请设置 NANOPI_API_KEY 环境变量')
+    console.error('请设置 NANOPI_API_KEY 环境变量（或在 .env 文件中配置）')
     process.exit(1)
   }
 
@@ -101,6 +103,17 @@ export async function persistSession(messages: Message[], file: string = SESSION
     await fs.appendFile(file, JSON.stringify(msg) + '\n', 'utf-8')
   }
   persistedCount = messages.length
+}
+
+/** 从 .env 文件加载环境变量（导出供测试）。
+ *  用 Node 22+ 内置的 process.loadEnvFile，不引入 dotenv 依赖。
+ *  不覆盖已存在的环境变量；文件不存在就静默跳过（.env 是可选的）。 */
+export function loadDotEnv(file: string = '.env'): void {
+  try {
+    process.loadEnvFile(file)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+  }
 }
 
 // 只在直接运行时启动（非 import 时）
