@@ -7,46 +7,58 @@
 // 直接 import stream 而非依赖注入——让学习者一眼看到"这是 LLM 交互点"。
 // pi 用 StreamFn 参数注入支持替换后端，教学版省略。
 
-import { stream, buildAssistantMessage, buildToolResultMessage, type Model, type Context } from './llm.js'
+import { stream, buildAssistantMessage, buildToolResultMessage, type Model, type Context, type Message } from './llm.js'
 
-/** 工具定义：name + 描述 + JSON Schema 参数 + execute 函数 */
+/** 工具定义 = 给模型看的"说明书"（name/description/parameters）+ 本地真正干活的 execute */
 export type AgentTool = {
   name: string
-  description: string
-  parameters: object  // JSON Schema
-  execute: (args: unknown, signal?: AbortSignal) => Promise<string>
+  description: string   // 模型靠这句话判断"什么时候该用我"，务必写清楚
+  parameters: object  // JSON Schema，告诉模型参数的形状
+  execute: (args: unknown, signal?: AbortSignal) => Promise<string>  // 模型不会执行它，由 agent 在本地调用
 }
 
-/** agent 对外的事件流，供 UI 消费 */
+/** agent 对外的事件流，供 UI 消费。比 llm 层多一个 tool_result——执行工具是 agent 的职责 */
 export type AgentEvent =
-  | { type: 'assistant_text'; delta: string }
-  | { type: 'tool_call'; id: string; name: string; args: unknown }
-  | { type: 'tool_result'; id: string; name: string; result: string }
-  | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
+  | { type: 'assistant_text'; delta: string }                                              // 模型文字（流式）
+  | { type: 'tool_call'; id: string; name: string; args: unknown }                         // 准备执行某个工具
+  | { type: 'tool_result'; id: string; name: string; result: string }                      // 工具执行完毕的结果
+  | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }      // 本轮结束及原因
 
-/** compaction 触发阈值：消息数超过此值时压缩旧消息 */
+/** compaction 触发阈值：消息数达到此值时压缩旧消息（按条数近似，不是 token 数） */
 const COMPACT_THRESHOLD = 50
 /** compaction 保留近期消息数 */
 const KEEP_RECENT = 20
 
+/** user 消息是否只携带 tool_result 块——压缩切点不能落在它前面，否则会拆散 tool_use/tool_result 配对 */
+function isToolResultMessage(m: Message): boolean {
+  return m.role === 'user' && Array.isArray(m.content) && m.content.length > 0
+    && m.content.every(b => b.type === 'tool_result')
+}
+
 /**
  * 对话压缩：当消息过多时，让 LLM 总结旧消息，用摘要替换。
  * 教的是"context 有上限，满了要压缩"——agent 自管理上下文的核心能力。
- * pi 的实现 970 行含 token 估算/cut point 边界/split turn 等，教学版极简为消息条数近似。
+ * pi 的实现 970 行含 token 估算/cut point 边界等，教学版按消息条数近似，
+ * 切点对齐轮次边界（见下方 while），相当于极简版 split turn。
+ * 压缩会让消息下标失效：cli 的 persistSession 检测到尾部错位后会整体重写 session 文件，文件与内存保持一致。
  */
 async function compactContext(model: Model, context: Context, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return  // abort 时不压缩——避免空摘要损坏 context
   if (context.messages.length < COMPACT_THRESHOLD) return
 
-  const oldMessages = context.messages.slice(0, -KEEP_RECENT)
-  const recentMessages = context.messages.slice(-KEEP_RECENT)
+  // 切点对齐轮次边界：tool_result 必须和它的 tool_use 留在同一侧，
+  // 否则压缩后 recent 以孤儿 tool_result 开头，下一次模型请求 API 直接 400。
+  let cut = context.messages.length - KEEP_RECENT
+  while (cut < context.messages.length && isToolResultMessage(context.messages[cut])) cut++
+  const oldMessages = context.messages.slice(0, cut)            // 前半段：要被总结掉的旧消息
+  const recentMessages = context.messages.slice(cut)            // 后半段：原样保留，模型仍能看到近期细节
 
   // 把旧消息序列化成纯文本让 LLM 总结
   const conversationText = oldMessages
     .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
     .join('\n')
 
-  // 用一轮非流式调用让 LLM 总结
+  // 仍调用 stream 收集摘要，但不把摘要增量发给 UI；只有完整成功的摘要才替换旧消息
   const summaryContext: Context = {
     systemPrompt: '请将以下对话总结为简洁的上下文摘要，保留关键决策、已做的工作和待办事项。',
     messages: [{ role: 'user', content: conversationText }],
@@ -55,7 +67,7 @@ async function compactContext(model: Model, context: Context, signal?: AbortSign
   let summary = ''
   let failed = false
   for await (const ev of stream(model, summaryContext, { signal })) {
-    if (ev.type === 'text_delta') summary += ev.delta
+    if (ev.type === 'text_delta') summary += ev.delta  // 摘要也是流式返回的，逐段拼起来
     else if (ev.type === 'error' || ev.type === 'done' && ev.stopReason === 'aborted') { failed = true; break }
   }
 
@@ -70,12 +82,13 @@ async function compactContext(model: Model, context: Context, signal?: AbortSign
 }
 
 /**
- * 运行 agent 循环。无 max_steps——loop 到模型说停为止。pi 同样无硬编码步数上限，但额外有 shouldStopAfterTurn 回调，教学版省略。
+ * 运行 agent 循环：问模型 → 有 tool_call 就执行 → 结果写回 context → 再问，直到模型不再调工具。
+ * 无 max_steps——loop 到模型说停为止。pi 同样无硬编码步数上限，但额外有 shouldStopAfterTurn 回调，教学版省略。
  *
  * @param model    模型配置
- * @param context  对话上下文（会被原地修改）
- * @param tools    工具注册表
- * @param signal   abort 信号
+ * @param context  对话上下文（会被原地修改——context 就是 agent 的全部状态）
+ * @param tools    工具注册表（说明书 + execute）
+ * @param signal   abort 信号（Ctrl+C 一路传到这里、fetch 和工具）
  */
 export async function* runAgent(
   model: Model,
@@ -83,25 +96,25 @@ export async function* runAgent(
   tools: AgentTool[],
   signal?: AbortSignal,
 ): AsyncGenerator<AgentEvent> {
-  const toolMap = new Map(tools.map(t => [t.name, t]))
-  const toolDefs = tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }))
+  const toolMap = new Map(tools.map(t => [t.name, t]))  // 本地执行用：按模型给出的工具名查找 execute
+  const toolDefs = tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }))  // API 只接收描述，不接收 execute
 
   while (true) {
     // 0. 对话压缩：消息过多时先压缩旧消息
     await compactContext(model, context, signal)
 
     // 1. 流式调用 LLM，收集文本和 tool_calls
-    let text = ''
+    let text = ''  // 本轮模型吐出的全部文字
     let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'aborted' = 'end_turn'
-    const toolCalls: { id: string; name: string; args: unknown }[] = []
+    const toolCalls: { id: string; name: string; args: unknown }[] = []  // 本轮收集到的完整工具调用
 
     for await (const ev of stream(model, context, { tools: toolDefs, signal })) {
       if (ev.type === 'text_delta') {
-        text += ev.delta
-        yield { type: 'assistant_text', delta: ev.delta }
+        text += ev.delta  // 自己存一份完整文本，稍后写回 Context
+        yield { type: 'assistant_text', delta: ev.delta }  // 同时转发给 UI 显示
       } else if (ev.type === 'tool_call') {
-        toolCalls.push({ id: ev.id, name: ev.name, args: ev.args })
-        yield { type: 'tool_call', id: ev.id, name: ev.name, args: ev.args }
+        toolCalls.push({ id: ev.id, name: ev.name, args: ev.args })  // 先存起来，等流结束后统一执行
+        yield { type: 'tool_call', id: ev.id, name: ev.name, args: ev.args }  // UI 可以先显示"正在调用 xxx"
       } else if (ev.type === 'done') {
         stopReason = ev.stopReason
         if (ev.stopReason === 'aborted') {
@@ -111,19 +124,19 @@ export async function* runAgent(
           return
         }
       } else if (ev.type === 'error') {
-        context.messages.push(buildAssistantMessage(text, []))
+        context.messages.push(buildAssistantMessage(text, []))  // 已收到的部分文本仍然保留，不让它凭空消失
         yield { type: 'assistant_text', delta: `\n[error] ${ev.error.message}` }
         yield { type: 'turn_end', stopReason: 'error' }
         return
       }
     }
 
-    // 2. 把 assistant 回复塞回 context
+    // 2. 把 assistant 回复塞回 context；工具结果必须接在对应的工具调用之后
     context.messages.push(buildAssistantMessage(text, toolCalls))
 
     // 3. 截断处理：max_tokens 时 tool args 可能不完整，不执行，把错误放回到 Context 让模型重发
     if (stopReason === 'max_tokens' && toolCalls.length > 0) {
-      const results = toolCalls.map(tc => ({
+      const results = toolCalls.map(tc => ({  // 每个 tool_call 都必须有结果——哪怕是"参数被截断"的错误说明
         tool_use_id: tc.id,
         content: `error: output truncated by max_tokens, tool "${tc.name}" args may be incomplete.`,
       }))
@@ -149,17 +162,17 @@ export async function* runAgent(
       const tool = toolMap.get(tc.name)
       let result: string
       if (!tool) {
-        result = `error: tool "${tc.name}" not found`
+        result = `error: tool "${tc.name}" not found`  // 模型编了个不存在的工具，如实告知它
       } else {
         try {
-          result = await tool.execute(tc.args, signal)
+          result = await tool.execute(tc.args, signal)  // 真正干活的一行：读写文件、执行命令都在这里发生
         } catch (e) {
-          result = `error: ${(e as Error).message}`
+          result = `error: ${(e as Error).message}`  // 工具失败不抛出，把错误文本喂回模型让它自己纠错
         }
       }
-      results.push({ tool_use_id: tc.id, content: result })
+      results.push({ tool_use_id: tc.id, content: result })  // id 对上号，API 才知道这是哪个调用的结果
       yield { type: 'tool_result', id: tc.id, name: tc.name, result }
-      if (signal?.aborted) break
+      if (signal?.aborted) break  // 中断后不再执行剩余工具
     }
 
     // 6. 为被 abort 跳过的 tool_call 补上错误结果（API 要求每个 tool_call 都有对应 tool_result）
@@ -168,7 +181,7 @@ export async function* runAgent(
       yield { type: 'tool_result', id: tc.id, name: tc.name, result: 'error: aborted' }
     }
 
-    // 7. 把 tool_result 放回到 Context，进入下一轮
+    // 7. 把 tool_result 放回到 Context，再问模型；工具执行成功不等于整个用户任务已经完成
     context.messages.push(buildToolResultMessage(results))
   }
 }

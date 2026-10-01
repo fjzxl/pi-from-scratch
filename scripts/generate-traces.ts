@@ -1,3 +1,21 @@
+// scripts/generate-traces.ts
+// 离线 Trace 生成器 —— 教学网站的"单步调试"功能需要一份真实执行记录。
+//
+// 它做什么：在临时目录里用真实模型跑 6 个典型任务，把 runAgent() 产生的
+//   AgentEvent 和每一步的 Context 全部录下来，输出成 web/app/trace-data.generated.ts。
+//   浏览器只回放这份静态数据，不会连接模型 API。
+//
+// 为什么需要"校验"：模型不是每次都按预期行动（比如该调工具却不调）。
+//   所以每个 case 结束后都要断言"确实发生了预期的事"，不满足就报错、拒绝写文件。
+//   这样 trace 永远是可信的教学素材，而不是一份翻车的现场录像。
+//
+// ⚠ 维护命令（需要真实 API Key，新手阅读网站时不需要运行）：
+//   NANOPI_API_KEY=... NANOPI_BASE_URL=... npm run generate:traces
+//   只重跑某一个案例：追加 TRACE_CASE=read-file（其余案例沿用生成文件中已有的数据，不会被覆盖）
+//
+// 注意：本脚本用"内容匹配"（findLine）定位源码行号，而不是写死行号，
+//   所以给 src/ 加注释不会让这里失效。
+
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -9,6 +27,7 @@ import type { TraceCase, TraceContext, TraceSource, TraceStep } from '../web/app
 
 type SourceFile = TraceSource['file']
 
+/** 一个 trace 案例的完整定义：跑什么任务、给什么工具、预期看到什么 */
 type CaseSpec = {
   id: string
   number: string
@@ -23,6 +42,7 @@ type CaseSpec = {
   abortAfterMs?: number
 }
 
+/** 录下来的一步：一个 AgentEvent 事件 + 事件发生时的 Context 快照 */
 type CapturedEvent = {
   event: AgentEvent
   context: Context
@@ -32,6 +52,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(here, '..')
 const outputPath = resolve(projectRoot, 'web/app/trace-data.generated.ts')
 
+/** 缺少环境变量就直接报错退出——生成 trace 必须用真实模型，不能拿假数据糊弄 */
 function requiredEnv(name: 'NANOPI_API_KEY' | 'NANOPI_BASE_URL'): string {
   const value = process.env[name]
   if (!value) throw new Error(`需要设置 ${name} 才能生成真实 trace。`)
@@ -41,6 +62,7 @@ function requiredEnv(name: 'NANOPI_API_KEY' | 'NANOPI_BASE_URL'): string {
 const apiKey = requiredEnv('NANOPI_API_KEY')
 const baseUrl = requiredEnv('NANOPI_BASE_URL').replace(/\/+$/, '')
 
+// 读入源码全文，供 findLine 做内容匹配（不写死行号，加注释不会失效）
 const sourceFiles = Object.fromEntries(
   await Promise.all(
     (['src/llm.ts', 'src/agent.ts', 'src/tools.ts', 'src/tui.ts', 'src/cli.ts'] as SourceFile[])
@@ -48,10 +70,15 @@ const sourceFiles = Object.fromEntries(
   ),
 ) as Record<SourceFile, string>
 
+/** 深拷贝 Context：录的是"那一刻"的状态，不能和后续变化共享引用 */
 function cloneContext(context: Context): TraceContext {
   return JSON.parse(JSON.stringify(context)) as TraceContext
 }
 
+/**
+ * 按内容找源码行号。occurrence=0 取第一次出现，-1 取最后一次。
+ * 用内容而不是行号定位，是为了让 trace 在源码加注释后依然有效。
+ */
 function findLine(file: SourceFile, needle: string, occurrence = 0): number {
   const matches = sourceFiles[file]
     .split('\n')
@@ -66,14 +93,17 @@ function source(file: SourceFile, needle: string, occurrence = 0): TraceSource {
   return { file, line: findLine(file, needle, occurrence) }
 }
 
+/** 把不可预测的临时目录路径替换成 /workspace，让 trace 数据稳定可复现 */
 function normalizeText(value: string, workspace: string): string {
   return value.split(workspace).join('/workspace')
 }
 
+/** 同上，但作用在任意 JSON 值上（消息数组、事件对象等） */
 function normalizeValue<T>(value: T, workspace: string): T {
   return JSON.parse(normalizeText(JSON.stringify(value), workspace)) as T
 }
 
+/** 判断一条消息是"工具结果"还是"模型回复"，用来决定界面上怎么描述这一步 */
 function messageKind(message: unknown): 'tool_result' | 'assistant' | 'other' {
   if (!message || typeof message !== 'object') return 'other'
   const item = message as { role?: string; content?: unknown }
@@ -87,6 +117,7 @@ function messageKind(message: unknown): 'tool_result' | 'assistant' | 'other' {
   return 'other'
 }
 
+/** Context 变化的来源行：写回 tool_result 还是写回 assistant message */
 function contextStepSource(context: TraceContext): TraceSource {
   const latest = context.messages.at(-1)
   if (messageKind(latest) === 'tool_result') {
@@ -95,6 +126,7 @@ function contextStepSource(context: TraceContext): TraceSource {
   return source('src/agent.ts', 'context.messages.push(buildAssistantMessage(text, toolCalls))', -1)
 }
 
+/** 每个 AgentEvent 对应 agent.ts 里的哪一行——回放时高亮它 */
 function eventSource(event: AgentEvent): TraceSource {
   switch (event.type) {
     case 'assistant_text':
@@ -149,6 +181,11 @@ function eventPresentation(event: AgentEvent): Pick<TraceStep, 'label' | 'detail
   }
 }
 
+/**
+ * 合并连续的 assistant_text 事件。
+ * 模型是流式输出的，一个句子会变成几十个 text_delta；全部保留会让 trace 变成"点一下走一个字"。
+ * 这里把它们合成一条完整文本，回放时才有"一句话逐渐写出来"的观感。
+ */
 function coalesceTextEvents(events: CapturedEvent[]): CapturedEvent[] {
   const result: CapturedEvent[] = []
   for (const captured of events) {
@@ -163,6 +200,14 @@ function coalesceTextEvents(events: CapturedEvent[]): CapturedEvent[] {
   return result
 }
 
+/**
+ * 把录制的事件流变成 TraceLab 能回放的步骤列表。
+ *
+ * 产出两类交替出现的步骤：
+ *   - context 步骤：Context 消息变多的那一刻（写回 assistant 或 tool_result）
+ *   - event  步骤：一个 AgentEvent（模型输出 / 调工具 / 工具结果 / 回合结束）
+ * 开头的 input 步骤是特例，代表"用户输入进入 Context"这个起点。
+ */
 function buildSteps(initial: TraceContext, captured: CapturedEvent[], finalContext: TraceContext): TraceStep[] {
   const steps: TraceStep[] = [{
     id: 'input',
@@ -218,6 +263,7 @@ function buildSteps(initial: TraceContext, captured: CapturedEvent[], finalConte
   return steps
 }
 
+/** 从内置工具里挑几个组成 case 的工具集（教学案例不需要给模型全部工具） */
 function pickTools(...names: string[]): AgentTool[] {
   const all = builtinTools()
   return names.map((name) => {
@@ -227,8 +273,11 @@ function pickTools(...names: string[]): AgentTool[] {
   })
 }
 
+// 6 个教学案例，覆盖 Agent Loop 的每一条分支。
+// 编号即网站上的展示顺序，从最简单的"一轮就结束"到最复杂的"被 Ctrl+C 打断"。
 const cases: CaseSpec[] = [
   {
+    // 分支：stopReason=end_turn，循环只跑一轮。理解 Agent Loop 的起点。
     id: 'plain-text',
     number: '01',
     title: '没有 tool_call',
@@ -239,6 +288,7 @@ const cases: CaseSpec[] = [
     tools: () => [],
   },
   {
+    // 分支：最典型的工具往返。模型调 read_file → 结果写回 Context → 第二轮纯文本收尾。
     id: 'read-file',
     number: '02',
     title: '读取一个文件',
@@ -252,6 +302,7 @@ const cases: CaseSpec[] = [
     tools: () => pickTools('read_file'),
   },
   {
+    // 分支：多工具串行。一轮里连续 edit + read_file，展示工具结果如何驱动下一次调用。
     id: 'edit-and-check',
     number: '03',
     title: '修改并验证',
@@ -268,6 +319,7 @@ const cases: CaseSpec[] = [
     tools: () => pickTools('edit', 'read_file'),
   },
   {
+    // 分支：工具抛异常。agent 不崩溃，而是把错误文本喂回 Context 让模型自己纠错。
     id: 'tool-error',
     number: '04',
     title: '工具执行失败',
@@ -283,6 +335,7 @@ const cases: CaseSpec[] = [
     }],
   },
   {
+    // 分支：max_tokens 截断。输出撞上限，本轮直接结束，不执行任何工具。
     id: 'max-tokens',
     number: '05',
     title: '撞上 max_tokens',
@@ -294,6 +347,7 @@ const cases: CaseSpec[] = [
     maxTokens: 512,
   },
   {
+    // 分支：用户按 Ctrl+C。abortAfterMs=20 让中断发生在请求刚发出的瞬间。
     id: 'abort-request',
     number: '06',
     title: '等待时按下 Ctrl+C',
@@ -306,6 +360,10 @@ const cases: CaseSpec[] = [
   },
 ]
 
+/**
+ * 跑一个案例并录成 TraceCase：新建临时工作区 → 真实调用 runAgent → 边跑边录 → 校验 → 清理。
+ * 案例输入文件放在独立临时目录，并提示模型只操作这些文件；这不是沙箱，文件工具仍能访问进程有权限访问的其他路径。
+ */
 async function runCase(spec: CaseSpec): Promise<TraceCase> {
   const workspace = await mkdtemp(join(tmpdir(), `nanopi-trace-${spec.id}-`))
   try {
@@ -397,14 +455,44 @@ for (const spec of selectedCases) {
   process.stdout.write('完成\n')
 }
 
+// 合并写回：TRACE_CASE 只重跑部分案例时，其余案例沿用生成文件里已有的数据，
+// 否则单案例重跑会把其他案例从 trace-data.generated.ts 里整个删掉。
+const partial = selectedCases.length < cases.length
+const existingRaw = partial ? await readFile(outputPath, 'utf8').catch(() => null) : null
+// 边界 = 分号 + 空行 + 下一个 export。用 \r?\n 兼容 LF/CRLF 检出差异；
+// JSON 字符串里的换行是转义的两字符 \n，不会被真实空行误伤（trace 数据嵌有源码摘录）
+const parseExport = (name: string): unknown => {
+  if (!existingRaw) return null
+  const start = existingRaw.indexOf(`export const ${name}`)
+  if (start < 0) return null
+  const boundary = /;\r?\n\r?\n(?=export const )/g
+  boundary.lastIndex = start + 1
+  const hit = boundary.exec(existingRaw)
+  const segment = existingRaw.slice(start, hit ? hit.index + 1 : undefined)
+  const match = segment.match(/= ([\s\S]*);\s*$/)
+  if (!match) return null
+  try { return JSON.parse(match[1]) } catch { return null }
+}
+const oldCases = (parseExport('traceCases') as TraceCase[] | null) ?? []
+const oldMeta = parseExport('traceMeta') as { model: string; generatedAt: string; liveGenerated: boolean } | null
+
+const newById = new Map(traceCases.map((c) => [c.id, c]))
+const oldById = new Map(oldCases.map((c) => [c.id, c]))
+const mergedCases = cases
+  .map((spec) => newById.get(spec.id) ?? oldById.get(spec.id))
+  .filter((c): c is TraceCase => Boolean(c))
+
+// 部分重跑时保留旧的 traceMeta：generatedAt 描述的是整份数据的生成时间，不能被单案例刷新
+const meta = partial && oldMeta ? oldMeta : {
+  model: 'glm-5.2',
+  generatedAt: new Date().toISOString(),
+  liveGenerated: true,
+}
+
 const output = `// Generated by ../../scripts/generate-traces.ts. Do not edit by hand.\n` +
   `import type { TraceCase, TraceMeta } from "./trace-types";\n\n` +
-  `export const traceMeta: TraceMeta = ${JSON.stringify({
-    model: 'glm-5.2',
-    generatedAt: new Date().toISOString(),
-    liveGenerated: true,
-  }, null, 2)};\n\n` +
-  `export const traceCases: TraceCase[] = ${JSON.stringify(traceCases, null, 2)};\n`
+  `export const traceMeta: TraceMeta = ${JSON.stringify(meta, null, 2)};\n\n` +
+  `export const traceCases: TraceCase[] = ${JSON.stringify(mergedCases, null, 2)};\n`
 
 await writeFile(outputPath, output, 'utf8')
-console.log(`已写入 ${traceCases.length} 个离线 trace。`)
+console.log(`已写入 ${mergedCases.length} 个离线 trace（本次重新生成 ${traceCases.length} 个）。`)

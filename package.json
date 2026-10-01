@@ -19,11 +19,13 @@
     "typescript-tutorial"
   ],
   "type": "module",
+  "engines": { "node": ">=22.13" },
   "bin": { "pi-from-scratch": "./dist/cli.js" },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
     "generate:traces": "tsx scripts/generate-traces.ts",
+    "check:slices": "node scripts/check-teaching-slices.mjs",
     "test": "vitest run"
   },
   "dependencies": {},

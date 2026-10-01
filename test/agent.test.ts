@@ -1,7 +1,8 @@
 // test/agent.test.ts
-// 测试 agent loop 的核心路径：纯文本回复、tool_call 执行后把结果放回到 Context、未知 tool 报错。
+// 测试 agent loop 的核心路径：纯文本回复、tool_call 执行后把结果放回到 Context、
+// 未知 tool 报错、compaction 切点对齐轮次边界。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { StreamEvent, Model, Context } from '../src/llm.js'
+import type { StreamEvent, Model, Context, Message } from '../src/llm.js'
 
 const { mockStreamFn } = vi.hoisted(() => ({
   mockStreamFn: vi.fn(async function* (): AsyncGenerator<StreamEvent> {
@@ -94,5 +95,44 @@ describe('runAgent', () => {
 
     const tr = events.find(e => e.type === 'tool_result') as { result: string }
     expect(tr.result).toContain('not found')
+  })
+
+  it('compaction：切点对齐轮次边界，不拆散 tool_use/tool_result', async () => {
+    // 构造 50 条消息，让默认切点（50 - 20 = 30）正好落在 tool_result 上：
+    // 29 条填充消息 + assistant(tool_use t1) + user(tool_result r1) + 19 条填充消息。
+    // 若切点不对齐，压缩后 recent 会以孤儿 tool_result 开头，下一次请求 API 400。
+    const messages: Message[] = []
+    for (let i = 0; i < 29; i++) messages.push({ role: 'user', content: `m${i}` })
+    messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'echo', input: {} }] })
+    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'r1' }] })
+    for (let i = 30; i < 49; i++) messages.push({ role: 'user', content: `m${i}` })
+
+    let round = 0
+    mockStreamFn.mockImplementation(async function* (): AsyncGenerator<StreamEvent> {
+      if (round === 0) {
+        yield { type: 'text_delta', delta: 'SUMMARY' }  // 第一次调用是压缩摘要请求
+        yield { type: 'done', stopReason: 'end_turn' }
+      } else {
+        yield { type: 'text_delta', delta: 'ok' }
+        yield { type: 'done', stopReason: 'end_turn' }
+      }
+      round++
+    })
+
+    const ctx: Context = { messages }
+    const events: { type: string; [k: string]: unknown }[] = []
+    for await (const e of runAgent(model, ctx, [] as AgentTool[])) events.push(e)
+
+    expect(events.at(-1)).toEqual({ type: 'turn_end', stopReason: 'end_turn' })
+
+    // 摘要请求的输入（old 侧）必须包含完整的 tool_use/tool_result 配对
+    const summaryCall = mockStreamFn.mock.calls[0] as unknown as [unknown, Context]
+    const summaryInput = summaryCall[1].messages[0].content as string
+    expect(summaryInput).toContain('tool_use')
+    expect(summaryInput).toContain('"tool_use_id":"t1"')
+
+    // 压缩后的 recent 以 m30 开头，而不是被切出来的孤儿 tool_result
+    expect(ctx.messages[0].content).toBe('[context summary]\nSUMMARY')
+    expect(ctx.messages[1]).toEqual({ role: 'user', content: 'm30' })
   })
 })
