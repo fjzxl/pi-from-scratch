@@ -222,7 +222,7 @@ type AgentEvent =
   | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
 ```
 
-TUI 不需要认识 LLM 的原始事件，也不需要知道工具怎么执行。它只消费这四种 AgentEvent。
+TUI 不需要认识 LLM 的原始事件，也不需要知道工具怎么执行。事件由 CLI 消费，再按这四种类型转调 TUI 对应的打印方法。
 
 <!-- checkpoint: agent-loop -->
 
@@ -364,7 +364,7 @@ context 就是这么一条一条长起来的。每轮 stream 加一条 assistant
 
 模型的输出有长度上限（由 `model.maxTokens` 控制）。如果模型的回复太长，会被 API 强制截断，`finish_reason` 返回 `length`（nanopi 映射成 `max_tokens`）。
 
-截断本身不可怕，文本截了就截了，读者能看到已输出的部分。可怕的是 tool_call 被截断。tool_call 的参数是 JSON，截了以后变成半截 JSON，解析出来的参数是残缺的。拿这个残缺参数去执行工具，轻则报错，重则写坏文件。
+截断本身不可怕，文本截了就截了，读者能看到已输出的部分。可怕的是 tool_call 被截断。tool_call 的参数是 JSON，截了以后变成半截 JSON，`JSON.parse` 必然失败，`flushToolCalls()` 会把它回退成空参数 `{}`。空参数交给工具几乎必然报错。
 
 nanopi 的处理很保守。如果 `stopReason === 'max_tokens'` 且有 tool_calls，不执行，而是把一条错误消息放回到 Context，告诉模型"你的输出被截断了，参数可能不完整，请重新发"。
 
@@ -429,7 +429,7 @@ agent 循环跑得越久，context 里的消息越多。每一轮对话至少加
 
 <!-- checkpoint: agent-compaction -->
 
-nanopi 的 compaction 非常粗暴，但概念完整。消息数超过 50 条时触发，把较早的消息拿出来让 LLM 做一次总结，用总结替换掉那些旧消息，最近 20 条保持原样。
+nanopi 的 compaction 非常粗暴，但概念完整。消息数达到 50 条时触发，把较早的消息拿出来让 LLM 做一次总结，用总结替换掉那些旧消息，最近 20 条保持原样——只有一个例外：切点不能拆散 tool_use 和 tool_result 的配对。
 
 ```typescript
 const COMPACT_THRESHOLD = 50
@@ -438,8 +438,11 @@ const KEEP_RECENT = 20
 async function compactContext(model, context, signal) {
   if (context.messages.length < COMPACT_THRESHOLD) return
 
-  const oldMessages = context.messages.slice(0, -KEEP_RECENT)
-  const recentMessages = context.messages.slice(-KEEP_RECENT)
+  // 切点默认落在"最近 20 条"的起点；若正好压在 tool_result 上，向后挪到轮次边界
+  let cut = context.messages.length - KEEP_RECENT
+  while (cut < context.messages.length && isToolResultMessage(context.messages[cut])) cut++
+  const oldMessages = context.messages.slice(0, cut)
+  const recentMessages = context.messages.slice(cut)
 
   // 让 LLM 总结旧消息
   const summaryContext = {
@@ -458,6 +461,8 @@ async function compactContext(model, context, signal) {
   ]
 }
 ```
+
+为什么要多这个 while？API 要求每个 tool_call 都有对应的 tool_result。如果切点正好落在一条 assistant(tool_use) 和它的 user(tool_result) 中间，压缩后的近期消息就会以一条没有配对的孤儿 tool_result 开头，下一次请求 API 会直接报 400。所以切点遇到 tool_result 就往后挪，让这对消息一起留在旧消息里被总结掉。
 
 这个函数在每轮循环的开头调用，先压缩再问 LLM。
 
@@ -485,7 +490,7 @@ messages[20]  assistant: "README 写好了。"
 
 模型下一轮看到的是摘要加上最近的对话，足以理解当前工作状态，而 context 的体积缩了一大截。
 
-pi 在这件事上花了近千行代码，做精确的 token 数估算、最优切割点计算、跨消息边界的 split turn 处理。nanopi 用消息条数代替 token 数，50 条一刀切。估算粗糙，但核心概念是一样的，context 有上限，满了要压，压缩靠让 LLM 总结旧消息。
+pi 在这件事上花了近千行代码，做精确的 token 数估算、最优切割点计算、跨消息边界的 split turn 处理。nanopi 用消息条数代替 token 数，50 条一刀切，只从 split turn 里借了上面那个最小保障：切点不拆散配对。估算粗糙，但核心概念是一样的，context 有上限，满了要压，压缩靠让 LLM 总结旧消息。
 
 有一个细节值得注意。如果 abort 被触发了（用户按了 Ctrl+C），compaction 会直接跳过。因为 abort 状态下 LLM 总结请求也会被中断，得到的可能是空摘要或半截摘要。用空摘要替换掉原始消息，比不压缩更危险。
 
@@ -496,7 +501,7 @@ pi 在这件事上花了近千行代码，做精确的 token 数估算、最优�
 
 <!-- checkpoint: tui -->
 
-`tui.ts` 处理这些事。它是一个 88 行的类，用 Node.js 的 `readline` 读一行用户输入，用 `process.stdout.write` 把文本逐字打印出来。
+`tui.ts` 处理这些事。它是一个百行出头的小类，用 Node.js 的 `readline` 读一行用户输入，用 `process.stdout.write` 把文本逐字打印出来。
 
 ```typescript
 class Tui {
@@ -529,9 +534,9 @@ class Tui {
 
 `>` 是提示符，流式打印的文字一个字一个字冒出来，`[tool: ...]` 和 `[result: ...]` 是工具调用和结果。非常朴素。
 
-`setBusy()` 这个方法值得提一嘴。agent 在跑的时候用户不能输入新的 prompt（否则会启动两个并发的 agent 循环），所以 agent 开始前 `setBusy(true)`，结束后 `setBusy(false)`。Ctrl+C 也只在 busy 状态下才拦截，空闲时 Ctrl+C 交给系统默认行为（退出程序）。
+`setBusy()` 这个方法值得提一嘴。agent 在跑的时候用户不能输入新的 prompt（否则会启动两个并发的 agent 循环），所以 agent 开始前 `setBusy(true)`，结束后 `setBusy(false)`。Ctrl+C 也只在 busy 状态下才拦截，空闲时 Ctrl+C 交给系统默认行为（退出程序）。输入流结束（比如空提示符下按 Ctrl+D，或者管道输入读完）时，readline 会触发 close，TUI 打印一行提示后退出，不会无声消失。
 
-tui 最重要的特点是它完全不知道 LLM 和 tool 的存在。它只认识 AgentEvent。外面给它什么事件，它就按类型打印对应的内容。这层解耦是设计上刻意做的。
+tui 最重要的特点是它完全不知道 LLM 和 tool 的存在。它只按 AgentEvent 的语义提供打印方法。外面发生什么事件，CLI 就转调对应的打印方法。这层解耦是设计上刻意做的。
 
 
 ### 换个"前端"
@@ -618,6 +623,8 @@ async function main() {
 <!-- checkpoint: cli-session -->
 
 每轮结束后调 `persistSession()`，把 context 里新增的消息 append 到 `~/.nanopi/session.jsonl`。下次启动时 `loadSession()` 把它们读回来，context 就恢复了。JSONL 格式是每行一个 JSON 对象，写起来简单（直接 appendFile），读起来也容错（某一行 JSON 坏了跳过，不影响其他行）。
+
+唯一的例外是 compaction：它把消息数组整体变短，下标全部偏移，按条数追加会丢消息甚至写错位置。所以 `persistSession()` 会校验"最后一条已落盘的消息"是否还在原来的位置，对不上就整体重写文件，让文件和内存里的 context 重新一致。
 
 
 一个能读能写能改代码能跑命令的 coding agent 就做好了。模块地图

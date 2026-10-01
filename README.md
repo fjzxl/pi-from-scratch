@@ -22,9 +22,19 @@
 
 > 文章保留古法手敲，尽可能没有ai味，希望大家读的开心。
 
+## 新手从这里开始
+
+- [新手入门指南](docs/getting-started.md)：环境准备、第一次运行、示例任务、常见问题和学习路线。
+- [初学者 7 天学习计划](docs/beginner-learning-plan.md)：逐日阅读顺序、动手练习和自测标准。
+- [项目逻辑图](docs/architecture.md)：五个模块的关系、Agent 执行流程，以及教学网站的数据来源。
+- [后续改进方向](docs/future-improvements.md)：基于当前实现整理的优先级路线和完成标准。
+- [配置示例](.env.example)：运行 nano-pi 时使用的环境变量模板。
+
+`src/` 的五个文件带完整中文注释，从模块职责到关键行都有说明，适合边读边跑。改动 `src/` 后，先在 `web/` 目录运行 `npm run generate:content` 同步源码快照，再回到项目根目录运行 `npm run check:slices`；增删源码行时还要对齐教学切片。详见[项目逻辑图中的说明](docs/architecture.md#改动源码前必读行号即契约)。
+
 ## 运行 nano-pi
 
-需要 Node.js 22 或更高版本，以及一个 OpenAI 兼容 API。
+需要 Node.js 22.13 或更高版本，以及一个 OpenAI 兼容 API。
 
 ```bash
 npm install
@@ -36,6 +46,8 @@ npm run dev
 
 - `NANOPI_MODEL`：模型名
 - `NANOPI_BASE_URL`：OpenAI 兼容接口地址，默认 `https://api.openai.com/v1`
+
+请将 `NANOPI_MODEL` 设置为 API 服务商支持的模型名；代码当前默认值为 `glm-5.2`。也可以将 `.env.example` 复制为根目录的 `.env` 后填写配置。
 
 线上 trace 是预先生成的静态数据，浏览网站不会发起模型请求。
 

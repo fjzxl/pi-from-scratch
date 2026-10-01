@@ -42,7 +42,7 @@ pi 里对应 `pi-agent-core`。
 
 四个工具：`read_file`、`write_file`、`edit`、`run_bash`。pi 的 agent-core 层也是这四个。
 
-每个工具是一个纯函数，接收参数返回字符串结果。它们不碰 agent 状态，不知道 Context 的存在，甚至不知道自己是被 agent 调用的。这样设计的好处是工具可以独立测试、独立替换，加一个新工具也不需要改 agent 的任何代码。
+每个工具是一个独立的函数，接收参数返回字符串结果。它们不碰 agent 状态（但读写文件、执行命令是有外部副作用的），不知道 Context 的存在，甚至不知道自己是被 agent 调用的。这样设计的好处是工具可以独立测试、独立替换，加一个新工具也不需要改 agent 的任何代码。
 
 对外暴露 `builtinTools()` 函数，返回四个工具的数组。
 
@@ -51,7 +51,7 @@ pi 里对应 `pi-agent-core`。
 
 终端界面。用 `readline` 读用户输入，用 `process.stdout.write` 流式打印模型回复，监听 Ctrl+C 触发 abort。
 
-`tui.ts` 不知道 LLM 的存在，也不知道工具怎么执行。它只认识 AgentEvent，来什么事件就打印什么内容。换成 Web 前端或者别的什么东西，agent 代码一行不用动。这跟 Web 开发里的前后端分离一个道理：agent 是后端，UI 是前端，AgentEvent 是它们之间的协议（类似于前后端中的restAPI、RPC等等）。
+`tui.ts` 不知道 LLM 的存在，也不知道工具怎么执行。它只按 AgentEvent 的语义提供打印方法（事件对象由 CLI 接收后再转调它），来什么事件就打印什么内容。换成 Web 前端或者别的什么东西，agent 代码一行不用动。这跟 Web 开发里的前后端分离一个道理：agent 是后端，UI 是前端，AgentEvent 是它们之间的协议（类似于前后端中的restAPI、RPC等等）。
 
 对外暴露 `Tui` 类，提供 `onPrompt()`、`onAbort()`、`printText()`、`printToolCall()`、`printToolResult()` 等方法。
 
@@ -75,7 +75,7 @@ pi 里对应 `pi-coding-agent`【碎碎念，在我们这可能比较简单，�
 
 ![nanopi 一轮完整的数据流](/figures/full-roundtrip.png)
 
-换个角度，看依赖关系。llm 不知道 agent 的存在，agent 不知道 tui 长什么样，tools 不知道自己被谁调用，tui 只认识 AgentEvent。cli 是唯一知道所有人的那个，它的工作就是把它们粘在一起。这种单向依赖让每个模块都可以独立替换，换掉 tui、换掉 tools、甚至换掉 llm 的 provider，上下游都不用改。
+换个角度，看依赖关系。llm 不知道 agent 的存在，agent 不知道 tui 长什么样，tools 不知道自己被谁调用，tui 只按 AgentEvent 的语义提供打印方法。cli 是唯一知道所有人的那个，它的工作就是把它们粘在一起。这种单向依赖让每个模块都可以独立替换，换掉 tui、换掉 tools、甚至换掉 llm 的 provider，上下游都不用改。
 
 ![nanopi 五模块依赖关系](/figures/module-architecture.png)
 
