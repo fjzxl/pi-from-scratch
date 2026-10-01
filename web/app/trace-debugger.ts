@@ -37,29 +37,31 @@ function sourceLabel(position: TraceSource): string {
   return (fullRepo[position.file] ?? "").split("\n")[position.line - 1]?.trim() || "step";
 }
 
+// ⚠ 以下行号阈值按“当前 src/ 的行号”硬编码，改动 src/ 后必须同步（与 lesson-data 的行号即契约同性质）
 function functionName(file: SourceFile, line: number): string {
   if (file === "src/tui.ts") {
-    if (line <= 54) return "Tui.prompt";
-    if (line <= 60) return "Tui.setBusy";
-    if (line <= 65) return "Tui.printText";
-    if (line <= 70) return "Tui.printToolCall";
-    if (line <= 75) return "Tui.printToolResult";
-    return "Tui.printTurnEnd";
+    if (line <= 63) return "Tui.prompt";
+    if (line <= 75) return "Tui.setBusy";
+    if (line <= 80) return "Tui.printText";
+    if (line <= 85) return "Tui.printToolCall";
+    if (line <= 90) return "Tui.printToolResult";
+    if (line <= 95) return "Tui.printTurnEnd";
+    return "Tui.stop";
   }
   if (file === "src/cli.ts") return "onPrompt";
-  if (file === "src/agent.ts") return line < 71 ? "compactContext" : "runAgent";
+  if (file === "src/agent.ts") return line < 84 ? "compactContext" : "runAgent";
   if (file === "src/tools.ts") {
-    if (line <= 31) return "truncateOutput";
-    if (line <= 49) return "read_file.execute";
-    if (line <= 69) return "write_file.execute";
-    if (line <= 95) return "edit.execute";
+    if (line <= 32) return "truncateOutput";
+    if (line <= 50) return "read_file.execute";
+    if (line <= 70) return "write_file.execute";
+    if (line <= 96) return "edit.execute";
     return "run_bash.execute";
   }
-  if (line <= 91) return "contextToOpenAIMessages";
-  if (line <= 139) return "handleSSELine";
-  if (line <= 154) return "flushToolCalls";
-  if (line <= 237) return "stream";
-  if (line <= 252) return "buildAssistantMessage";
+  if (line <= 95) return "contextToOpenAIMessages";
+  if (line <= 143) return "handleSSELine";
+  if (line <= 158) return "flushToolCalls";
+  if (line <= 242) return "stream";
+  if (line <= 257) return "buildAssistantMessage";
   return "buildToolResultMessage";
 }
 
@@ -71,7 +73,7 @@ function callStack(position: TraceSource): TraceCallFrame[] {
     return frames;
   }
   if (position.file !== "src/cli.ts") {
-    if (position.file === "src/agent.ts" && position.line < 71) {
+    if (position.file === "src/agent.ts" && position.line < 84) {
       frames.push({ name: "runAgent", source: source("src/agent.ts", "await compactContext(model, context, signal)") });
     } else if (position.file !== "src/agent.ts") {
       frames.push({ name: "runAgent", source: source("src/agent.ts", "for await (const ev of stream") });
@@ -388,12 +390,14 @@ export function buildDebugFrames(traceCase: TraceCase): TraceDebugFrame[] {
           push("src/agent.ts", "context.messages.push(buildAssistantMessage(text, []))");
         }
         push("src/agent.ts", "yield { type: 'turn_end', stopReason: 'aborted'", { event: step.event });
-        push("src/agent.ts", "return", { occurrence: 3 });
+        // ⚠ occurrence 依赖 agent.ts 中 "return" 的出现次序（当前第 5 处 = abort 分支的 return）
+        push("src/agent.ts", "return", { occurrence: 4 });
       } else {
         push("src/agent.ts", "const reason = stopReason");
         push("src/agent.ts", "if (toolCalls.length === 0)");
         push("src/agent.ts", "yield { type: 'turn_end', stopReason: reason", { event: step.event });
-        push("src/agent.ts", "return", { occurrence: 5 });
+        // ⚠ occurrence 依赖 agent.ts 中 "return" 的出现次序（当前第 7 处 = 无 tool_call 的 return）
+        push("src/agent.ts", "return", { occurrence: 6 });
       }
       push("src/cli.ts", "case 'turn_end'", { event: step.event });
       if (reason === "max_tokens") push("src/cli.ts", "if (ev.stopReason === 'max_tokens')");

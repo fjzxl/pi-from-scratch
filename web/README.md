@@ -1,6 +1,8 @@
 # PI from Scratch Web
 
-交互式教学网站。正文来自根目录的 `docs/`，源码快照来自 `src/`，构建前会自动同步。
+交互式教学网站。正文来自根目录的 `docs/`，源码快照来自 `src/`；源文件齐全时，构建前会自动同步，否则使用已提交的内容快照。
+
+首次接触项目可以先看[新手入门指南](../docs/getting-started.md)和[项目逻辑图](../docs/architecture.md)。以下命令在 `web/` 目录执行。
 
 ```bash
 npm install
@@ -28,3 +30,5 @@ npm run build
 ```
 
 网站使用离线 trace，不需要 API Key。
+
+Windows PowerShell 的启动命令，以及内容生成缺少大纲文件时使用已提交快照的说明，见[新手指南的教学网站章节](../docs/getting-started.md#4-本地运行教学网站)。

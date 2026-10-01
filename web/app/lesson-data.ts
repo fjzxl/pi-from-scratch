@@ -1,7 +1,6 @@
 import { lessonMarkdown, sourceFiles } from "./content.generated";
 
 export type RepoSnapshot = Record<string, string>;
-
 export type Checkpoint = {
   id: string;
   label: string;
@@ -21,10 +20,14 @@ export type Lesson = {
   checkpoints: Checkpoint[];
 };
 
-const fullRepo: RepoSnapshot = { ...sourceFiles };
+// 教学网站展示"完整仓库"的几个阶段直接用源文件全文，见下方 llm/agent/... 声明后的 fullRepo。
 
+// 按行号区间截取源码，用来给教学网站分阶段展示代码。
+// 行尾在这里统一成 "\n"：源码在 Windows 上 checkout 是 CRLF，
+// 若直接 split("\n")，每行会残留一个 "\r"，切片边界处 trimEnd() 的行为就不一致，
+// assertProgressiveCheckpoints 会误判成"改写了旧代码"而让构建失败。
 function selectLines(code: string, ranges: Array<[number, number]>): string {
-  const lines = code.split("\n");
+  const lines = code.replace(/\r\n/g, "\n").split("\n");
   return ranges
     .map(([start, end]) => lines.slice(start - 1, end).join("\n"))
     .join("\n")
@@ -45,11 +48,26 @@ chapter1Markdown = addAnchor(chapter1Markdown, "## 它们怎么协作", "ch1-cut
 
 const repo = (files: RepoSnapshot): RepoSnapshot => ({ ...files });
 
-const llm = sourceFiles["src/llm.ts"];
-const agent = sourceFiles["src/agent.ts"];
-const tools = sourceFiles["src/tools.ts"];
-const tui = sourceFiles["src/tui.ts"];
-const cli = sourceFiles["src/cli.ts"];
+// 统一行尾为 "\n"。源码在 Windows 上 checkout 是 CRLF，
+// 而下面的 selectLines 与直接使用全文的阶段（如 agent-compaction）必须用同一种行尾，
+// 否则 assertProgressiveCheckpoints 会误判成"改写了旧代码"而导致构建失败。
+const normalizeEol = (code: string): string => code.replace(/\r\n/g, "\n");
+
+const llm = normalizeEol(sourceFiles["src/llm.ts"]);
+const agent = normalizeEol(sourceFiles["src/agent.ts"]);
+const tools = normalizeEol(sourceFiles["src/tools.ts"]);
+const tui = normalizeEol(sourceFiles["src/tui.ts"]);
+const cli = normalizeEol(sourceFiles["src/cli.ts"]);
+
+// 教学网站展示"完整仓库"的几个阶段直接用源文件全文，用归一化后的版本，
+// 保证与 selectLines 切片的行尾一致。
+const fullRepo: RepoSnapshot = {
+  "src/llm.ts": llm,
+  "src/agent.ts": agent,
+  "src/tools.ts": tools,
+  "src/tui.ts": tui,
+  "src/cli.ts": cli,
+};
 
 const chapter1Checkpoints: Checkpoint[] = [
   { id: "ch1-overview", label: "五个文件", file: "src/llm.ts", repo: {} },
@@ -63,133 +81,142 @@ const chapter1Checkpoints: Checkpoint[] = [
 
 // 每个阶段都只挑选最终源码中已经讲到的行。后续阶段只能插入新行，
 // 不能删掉或改写旧行，否则编辑器会把原有骨架误判成整段新代码。
+//
+// ⚠ 行号即契约：下面的区间按“当前 src/ 的行号”硬编码，改动源码后必须重新映射。
+// 运行 `npm run check:slices` 可以校验区间是否仍然与源码对齐（只校验，不会自动改区间）。
+// （最近一次同步：llm.ts 注释措辞 ±0 行、agent.ts compaction 切点对齐 +12 行、
+//   cli.ts Windows 启动守卫 +3 行、持久化对齐校验再 +2 行（切片区间同步平移）、tools.ts 截断取舍注释 +1 行。）
 const pseudoAgent = selectLines(agent, [
   [1, 5],
   [9, 9],
-  [80, 85],
-  [88, 89],
-  [92, 94],
-  [96, 98],
-  [119, 123],
-  [137, 137],
-  [140, 140],
-  [142, 148],
-  [163, 164],
-  [171, 174],
+  [93, 98],
+  [101, 102],
+  [105, 107],
+  [109, 111],
+  [132, 136],
+  [150, 150],
+  [153, 153],
+  [155, 161],
+  [176, 177],
+  [184, 187],
 ]);
 
-const llmTypes = selectLines(llm, [[1, 49]]);
+// ⚠ 这些区间的边界是刻意"差一行"的：llmTypes 结束在 `}`（第 50 行），
+// 后续切片的第一段到第 51 行（多带一个空行），靠 selectLines 末尾的 trimEnd()
+// 消掉空行后两者文本一致，assertProgressiveCheckpoints 才会判定为"只增不改"。
+// 改这些数字时必须保持这个错位关系，否则教学站构建会失败。
+const llmTypes = selectLines(llm, [[1, 50]]);
 const llmStream = selectLines(llm, [
-  [1, 50],
-  [156, 169],
-  [172, 172],
-  [237, 237],
+  [1, 51],
+  [158, 172],
+  [175, 175],
+  [240, 240],
 ]);
 const llmRequest = selectLines(llm, [
-  [1, 50],
-  [156, 200],
-  [237, 237],
+  [1, 51],
+  [158, 203],
+  [240, 240],
 ]);
 const llmSseParse = selectLines(llm, [
-  [1, 50],
-  [93, 200],
-  [237, 237],
+  [1, 51],
+  [95, 203],
+  [240, 240],
 ]);
 const llmParsed = selectLines(llm, [
-  [1, 50],
-  [93, 237],
+  [1, 51],
+  [95, 240],
 ]);
-const llmWithContextConversion = selectLines(llm, [[1, 237]]);
+const llmWithContextConversion = selectLines(llm, [[1, 240]]);
 
 const toolsStructure = selectLines(tools, [
   [1, 6],
   [11, 12],
-  [33, 44],
-  [48, 49],
+  [34, 45],
+  [49, 50],
 ]);
 const toolsRead = selectLines(tools, [
   [1, 6],
   [9, 12],
-  [14, 49],
+  [14, 50],
 ]);
 const toolsWrite = selectLines(tools, [
   [1, 6],
   [9, 12],
-  [14, 69],
+  [14, 70],
 ]);
 const toolsEdit = selectLines(tools, [
   [1, 6],
   [9, 12],
-  [14, 95],
+  [14, 96],
 ]);
 
 const agentToolType = selectLines(agent, [
   [1, 5],
   [9, 9],
   [12, 19],
-  [80, 85],
-  [88, 89],
-  [92, 94],
-  [96, 98],
-  [119, 123],
-  [137, 137],
-  [140, 140],
-  [142, 148],
-  [163, 164],
-  [171, 174],
+  [93, 98],
+  [101, 102],
+  [105, 107],
+  [109, 111],
+  [132, 136],
+  [150, 150],
+  [153, 153],
+  [155, 161],
+  [176, 177],
+  [184, 187],
 ]);
 
 const agentTypes = selectLines(agent, [
   [1, 26],
-  [80, 85],
-  [88, 89],
-  [92, 94],
-  [96, 98],
-  [119, 123],
-  [137, 137],
-  [140, 140],
-  [142, 148],
-  [163, 164],
-  [171, 174],
+  [93, 98],
+  [101, 102],
+  [105, 107],
+  [109, 111],
+  [132, 136],
+  [150, 150],
+  [153, 153],
+  [155, 161],
+  [176, 177],
+  [184, 187],
 ]);
 
 const agentLoop = selectLines(agent, [
   [1, 26],
-  [72, 89],
-  [92, 106],
-  [118, 123],
-  [137, 161],
-  [163, 164],
-  [171, 174],
+  [84, 102],
+  [105, 119],
+  [131, 136],
+  [150, 174],
+  [176, 177],
+  [184, 187],
 ]);
 
 const agentMaxTokens = selectLines(agent, [
   [1, 26],
-  [72, 89],
-  [92, 106],
-  [118, 161],
-  [163, 164],
-  [171, 174],
+  [84, 102],
+  [105, 119],
+  [131, 174],
+  [176, 177],
+  [184, 187],
 ]);
 
 const agentAbort = selectLines(agent, [
   [1, 26],
-  [72, 89],
-  [92, 112],
-  [118, 174],
+  [84, 102],
+  [105, 125],
+  [131, 187],
 ]);
 
 const agentError = selectLines(agent, [
   [1, 26],
-  [72, 89],
-  [92, 174],
+  [84, 102],
+  [105, 187],
 ]);
 
 const cliMain = selectLines(cli, [
-  [1, 4],
-  [8, 12],
-  [16, 18],
-  [23, 78],
+  [1, 5],
+  [9, 14],
+  [18, 20],
+  [26, 81],
 ]);
 
 const emptyRepo: RepoSnapshot = {
